@@ -19,6 +19,7 @@ CÂU HỎI PHẢI TRẢ LỜI TRƯỚC KHI VIẾT (ghi câu trả lời vào rep
   Con số đó nằm TRONG RTO của bạn. Muốn RTO 5 phút thì được phép chọn interval bao nhiêu?
 """
 import argparse
+import datetime as dt
 import json
 import pathlib
 import time
@@ -29,13 +30,141 @@ URL = {"a": "http://127.0.0.1:8001", "b": "http://127.0.0.1:8002"}
 
 
 def probe(region: str, timeout: float) -> tuple[bool, str]:
-    """TODO: trả về (ready, reason). Timeout PHẢI có — netblock làm request treo mãi."""
-    raise NotImplementedError
+    """Return the readiness of one region without leaking transport errors.
+
+    A failed readiness response is deliberately different from a liveness check:
+    a process can answer HTTP while its model, vector data, or compute pool is not
+    ready.  Network failures are observations, not errors in the checker itself,
+    so callers always receive a ``(ready, reason)`` tuple.
+    """
+    if region not in URL:
+        raise ValueError(f"unknown region: {region!r}")
+    if timeout <= 0:
+        raise ValueError("timeout must be greater than zero")
+
+    try:
+        response = httpx.get(f"{URL[region]}/readyz", timeout=timeout)
+    except Exception as exc:  # timeout/connect errors are failed probes
+        detail = str(exc).strip()
+        reason = type(exc).__name__
+        if detail:
+            reason = f"{reason}: {detail}"
+        return False, reason
+
+    if response.status_code == 200:
+        return True, "ready"
+
+    reason = f"http_status={response.status_code}"
+    try:
+        body = response.json()
+        reasons = body.get("reasons") if isinstance(body, dict) else None
+        if isinstance(reasons, list) and reasons:
+            reason = ", ".join(str(item) for item in reasons)
+        elif reasons:
+            reason = str(reasons)
+        elif isinstance(body, dict) and body.get("error"):
+            reason = str(body["error"])
+    except Exception:
+        # A malformed error body must not crash the monitoring loop.
+        pass
+    return False, reason
+
+
+def _iso(ts: float) -> str:
+    return dt.datetime.fromtimestamp(ts, dt.timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def run(interval: float, timeout: float, threshold: int, duration: float, out: pathlib.Path):
-    """TODO: vòng lặp poll + phát hiện transition + ghi JSONL."""
-    raise NotImplementedError
+    """Poll both regions and append only readiness state transitions to JSONL."""
+    if interval <= 0:
+        raise ValueError("interval must be greater than zero")
+    if timeout <= 0:
+        raise ValueError("timeout must be greater than zero")
+    if threshold <= 0:
+        raise ValueError("threshold must be greater than zero")
+    if duration < 0:
+        raise ValueError("duration cannot be negative")
+
+    out = pathlib.Path(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    # The stack starts in its declared healthy baseline.  Suppressing an initial
+    # HEALTHY observation keeps this file a transition log rather than a poll log.
+    states = {region: "HEALTHY" for region in URL}
+    consecutive_fails = {region: 0 for region in URL}
+    started = time.monotonic()
+    deadline = started + duration
+    poll_number = 1
+    boundary_tolerance = max(1e-9, abs(duration) * 1e-12)
+
+    with out.open("a", encoding="utf-8") as log:
+        while True:
+            next_poll = started + poll_number * interval
+            if next_poll > deadline + boundary_tolerance:
+                break
+            sleep_for = next_poll - time.monotonic()
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+
+            for region in URL:
+                ready, reason = probe(region, timeout)
+                if ready:
+                    consecutive_fails[region] = 0
+                    if states[region] == "UNHEALTHY":
+                        now = time.time()
+                        event = {
+                            "event": "state_change",
+                            "ts": now,
+                            "iso": _iso(now),
+                            "region": region,
+                            "from": "UNHEALTHY",
+                            "to": "HEALTHY",
+                            "reason": reason,
+                            "consecutive_fails": 0,
+                            "interval_s": interval,
+                            "threshold": threshold,
+                        }
+                        log.write(json.dumps(event, ensure_ascii=False) + "\n")
+                        log.flush()
+                        states[region] = "HEALTHY"
+                    continue
+
+                consecutive_fails[region] += 1
+                if (states[region] == "HEALTHY"
+                        and consecutive_fails[region] >= threshold):
+                    now = time.time()
+                    event = {
+                        "event": "state_change",
+                        "ts": now,
+                        "iso": _iso(now),
+                        "region": region,
+                        "from": "HEALTHY",
+                        "to": "UNHEALTHY",
+                        "reason": reason,
+                        "consecutive_fails": consecutive_fails[region],
+                        "interval_s": interval,
+                        "threshold": threshold,
+                    }
+                    log.write(json.dumps(event, ensure_ascii=False) + "\n")
+                    log.flush()
+                    states[region] = "UNHEALTHY"
+
+            # Keep a fixed cadence, but skip slots missed by slow probes.  Never
+            # run back-to-back catch-up probes and mistake them for independent
+            # failures separated by a real monitoring interval.
+            poll_number += 1
+            now = time.monotonic()
+            next_poll = started + poll_number * interval
+            if next_poll <= now:
+                first_future_slot = int((now - started) // interval) + 1
+                poll_number = max(poll_number, first_future_slot)
+
+    return {
+        "states": states,
+        "consecutive_fails": consecutive_fails,
+        "elapsed_s": round(time.monotonic() - started, 3),
+        "out": str(out),
+    }
 
 
 if __name__ == "__main__":
